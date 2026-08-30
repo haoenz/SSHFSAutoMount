@@ -129,7 +129,6 @@ function Get-DriveTargetMap {
 function Set-SSHFSDriveLabel {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$DriveLetter,
         [Parameter(Mandatory)][string]$Label,
         [Parameter(Mandatory)][string]$Unc
     )
@@ -188,7 +187,7 @@ function Remove-MountPoints2Label {
     } catch { }
 }
 
-# ---------- 内部函数: 挂载日志 (计划任务隐藏窗口运行时, 事后排查登录挂载失败的唯一线索) ----------
+# ---------- 内部函数: 挂载日志 (计划任务静默运行时的排障依据) ----------
 function Write-MountLog {
     [CmdletBinding()]
     param(
@@ -199,7 +198,7 @@ function Write-MountLog {
         $logDir = Join-Path $script:StateDir 'logs'
         New-Item -ItemType Directory -Path $logDir -Force | Out-Null
         $logFile = Join-Path $logDir "$Name.log"
-        # 单文件超过 512KB 时清空重写, 防止无限增长
+        # 超 512KB 清空重写, 防止无限增长
         if ((Test-Path -LiteralPath $logFile) -and ((Get-Item -LiteralPath $logFile).Length -gt 512KB)) {
             Set-Content -LiteralPath $logFile -Value '' -Encoding utf8
         }
@@ -209,9 +208,7 @@ function Write-MountLog {
 
 # ---------- 内部函数: 从 Z 往前找第一个可用盘符 ----------
 function Get-AvailableDriveLetter {
-    # Z=90 递减到 C=67 (跳过 A/B, 避免软驱/系统保留盘符)
-    # 本地设备占用(DriveInfo)与已网络映射(Get-DriveTargetMap)都算不可用; 一次性取齐,
-    # 避免旧版逐盘符调用 net use(最多 24 个子进程)
+    # 本地设备(DriveInfo)与网络映射占用一次性取齐, 避免逐盘符调 net use; Z..C 递减, 跳过 A/B
     $used = @{}
     foreach ($d in [System.IO.DriveInfo]::GetDrives()) {
         if ($d.Name -match '^([A-Za-z]):') { $used[$Matches[1].ToUpper()] = $true }
@@ -224,8 +221,7 @@ function Get-AvailableDriveLetter {
     throw '未找到可用盘符: Z..C 均被占用'
 }
 
-# ---------- 内部函数: 无状态记录时, 按资源管理器显示名残留识别本别名旧挂载的盘符 ----------
-# 兼容 v1.0 时期挂载(尚无状态文件)的识别: MountPoints2 中 ##sshfs.k#* 键的 _LabelFromReg 即别名
+# ---------- 内部函数: 无状态文件时, 按显示名残留识别本别名旧挂载的盘符 (兼容 v1.0) ----------
 function Find-LegacyAliasDrive {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Name)
@@ -248,6 +244,22 @@ function Find-LegacyAliasDrive {
         }
     } catch { }
     return $null
+}
+
+# ---------- 内部函数: 判断某 SSHFS UNC 是否为本别名自己的挂载 ----------
+# 依据 MountPoints2 中该 UNC 键的 _LabelFromReg 是否等于别名(与 Find-LegacyAliasDrive 同一识别机制)
+function Test-SSHFSDriveOwnedByAlias {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Unc
+    )
+    try {
+        $keyName = ($Unc -replace '\\', '#')
+        $keyPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2\$keyName"
+        $p = Get-ItemProperty -Path $keyPath -Name '_LabelFromReg' -ErrorAction Stop
+        return ($p._LabelFromReg -eq $Name)
+    } catch { return $false }
 }
 
 # ---------- 内部函数: 为别名选择挂载盘符 (优先复用该别名上次使用的盘符) ----------
@@ -273,8 +285,7 @@ function Select-MountDriveLetter {
             return $letter        # 已挂载同一目标, 复用 (幂等)
         }
         elseif ($cur -ieq $state.Unc) {
-            # 盘符仍映射着上次挂载的 UNC, 而配置里的地址已变
-            # -> 旧映射即失效映射, 复用盘符以便后续删除重挂, 保持 Z:\ 路径不漂移
+            # 配置地址已变而盘符仍是旧 UNC(失效映射), 复用盘符以便原地替换, 路径不漂移
             Write-Verbose "配置地址已变更 ($($state.Unc) -> $Unc), 复用 ${letter}: 并替换失效映射"
             return $letter
         } else {
@@ -326,6 +337,14 @@ function Mount-SSHFSDrive {
     将挂载过程追加写入日志文件 ~/.ssh/sshfsmount/logs/<Name>.log,
     便于排查计划任务静默运行(-WindowStyle Hidden)时的失败原因。
 
+    .PARAMETER Force
+    指定盘符当前映射着其他别名的 SSHFS 挂载时, 允许强行断开并占用该盘符。
+    默认拒绝, 避免误伤同模块管理的其他挂载。
+
+    .NOTES
+    对失联的 SSHFS 挂载点执行 Test-Path 可能阻塞数十秒才返回, 属 Windows 固有行为;
+    挂载重试与盘符探测逻辑已尽量避免触发, 但无法完全规避。
+
     .EXAMPLE
     Mount-SSHFSDrive home
 
@@ -341,7 +360,8 @@ function Mount-SSHFSDrive {
         [string]$Provider = $script:SSHFSProvider,
         [int]$MaxRetries = 12,
         [int]$RetryInterval = 5,
-        [switch]$Log
+        [switch]$Log,
+        [switch]$Force
     )
 
     if (-not $Label) { $Label = $Name }
@@ -367,7 +387,7 @@ function Mount-SSHFSDrive {
             } else {
                 Write-Verbose "${k}: 已映射到 $unc, 无需重复挂载"
             }
-            Set-SSHFSDriveLabel -DriveLetter $k -Label $Label -Unc $unc
+            Set-SSHFSDriveLabel -Label $Label -Unc $unc
             Save-MountState -Name $Name -DriveLetter $k -Unc $unc -Label $Label
             if ($Log) { Write-MountLog -Name $Name -Message "目标已映射到 ${k}:, 直接复用(幂等)" }
             return [pscustomobject]@{
@@ -379,20 +399,27 @@ function Mount-SSHFSDrive {
         }
     }
 
-    $mounted = $false
     for ($i = 1; $i -le $MaxRetries; $i++) {
         $cur = Get-DriveTarget -DriveLetter $DriveLetter
         if ($cur) {
             if ($cur -ieq $unc) {
                 Write-Verbose "${DriveLetter}: 已映射到 $unc, 无需重复挂载"
                 if ($Log) { Write-MountLog -Name $Name -Message "${DriveLetter}: 已映射到 $unc, 无需重复挂载(幂等)" }
-                $mounted = $true
                 break
             }
             Write-Warning "${DriveLetter}: 当前映射到 $cur, 先断开旧映射"
+            # 保护: 映射着其他别名的 SSHFS 挂载时, 未经 -Force 拒绝断开
+            $stateOwn = Get-MountState -Name $Name
+            $ownUnc = if ($stateOwn) { $stateOwn.Unc } else { $null }
+            if (-not $Force -and $cur -like "\\$Provider\*" -and $cur -ine $ownUnc -and
+                -not (Test-SSHFSDriveOwnedByAlias -Name $Name -Unc $cur)) {
+                $msg = "${DriveLetter}: 当前映射着其他 SSHFS 挂载 $cur, 拒绝自动断开; 请换盘符, 或确认后加 -Force 覆盖"
+                if ($Log) { Write-MountLog -Name $Name -Message $msg }
+                throw $msg
+            }
             net use "${DriveLetter}:" /delete /y | Out-Null
             Start-Sleep -Seconds 1
-            # 断开失败(常见于映射被进程占用)时立即报错, 避免重试循环空转 MaxRetries 轮
+            # 断开失败(映射被占用)立即报错, 避免空转重试
             if (Get-DriveTarget -DriveLetter $DriveLetter) {
                 $msg = "${DriveLetter}: 旧映射 $cur 断开失败(可能被进程占用), 请手动执行: net use ${DriveLetter}: /delete /y"
                 if ($Log) { Write-MountLog -Name $Name -Message $msg }
@@ -400,20 +427,19 @@ function Mount-SSHFSDrive {
             }
             Remove-MountPoints2Label -Unc $cur   # 清掉旧目标的资源管理器显示名残留
         } elseif (Test-Path "${DriveLetter}:\") {
+            # 注: 对失联的 SSHFS 挂载点, Test-Path 可能阻塞数十秒(Windows 固有行为), 无法完全规避
             throw "${DriveLetter}: 被本地设备占用(非网络映射), 请先释放"
         }
 
         Write-Verbose "尝试挂载 ($i/$MaxRetries): net use ${DriveLetter}: $unc"
         $err = net use "${DriveLetter}:" "$unc" /persistent:yes 2>&1 | Out-String
         if ($LASTEXITCODE -eq 0) {
-            $mounted = $true
             break
         }
         # SSHFS-Win 的挂载是异步的: net use 可能返回错误 67(找不到网络名) 这种"假失败",
         # 但映射已在后台建立成功。先验证盘符实际可用性, 可用即视为成功。
         Start-Sleep -Seconds 2
         if (Test-Path -LiteralPath "${DriveLetter}:\" -ErrorAction SilentlyContinue) {
-            $mounted = $true
             Write-Warning "net use 返回错误($($err.Trim())), 但 ${DriveLetter}: 已实际挂载, 视为成功"
             if ($Log) { Write-MountLog -Name $Name -Message "net use 返回错误($($err.Trim())), 但 ${DriveLetter}: 已实际挂载, 视为成功" }
             break
@@ -425,7 +451,6 @@ function Mount-SSHFSDrive {
         } else {
             # 最后一轮兜底: 映射条目可能刚注册而连接尚未完全就绪, Test-Path 可能为 false
             if (Get-DriveTarget -DriveLetter $DriveLetter) {
-                $mounted = $true
                 Write-Warning "net use 返回错误($($err.Trim())), 但 ${DriveLetter}: 已映射, 视为成功"
                 if ($Log) { Write-MountLog -Name $Name -Message "net use 返回错误($($err.Trim())), 但 ${DriveLetter}: 已映射, 视为成功" }
                 break
@@ -434,10 +459,15 @@ function Mount-SSHFSDrive {
             throw "挂载失败: $($err.Trim())"
         }
     }
-    if (-not $mounted) { throw '挂载失败' }
+
+    # 兜底校验: 循环唯一正常出口是成功 break, 这里以实际映射为准
+    if (-not (Get-DriveTarget -DriveLetter $DriveLetter)) {
+        if ($Log) { Write-MountLog -Name $Name -Message "挂载异常退出: ${DriveLetter}: 无有效映射" }
+        throw "挂载失败: ${DriveLetter}: 无有效映射"
+    }
 
     # 设置资源管理器盘符显示名
-    Set-SSHFSDriveLabel -DriveLetter $DriveLetter -Label $Label -Unc $unc
+    Set-SSHFSDriveLabel -Label $Label -Unc $unc
     Save-MountState -Name $Name -DriveLetter $DriveLetter -Unc $unc -Label $Label
     if ($Log) { Write-MountLog -Name $Name -Message "挂载成功: $unc -> ${DriveLetter}:" }
 
@@ -504,17 +534,17 @@ function Register-SSHFSAutoMount {
         $Description = "登录时自动挂载 SSHFS 远程目录 ($Name$driveDesc)"
     }
 
-    # 盘符留空时不传 -DriveLetter, 由计划任务执行时自动从 Z 往前找可用盘符; -Log 用于登录挂载失败的事后排查
+    # 盘符留空则由计划任务执行时自动选; -Log 保证登录挂载失败可事后排查
     $driveArg = if ($DriveLetter) { " -DriveLetter '$DriveLetter'" } else { '' }
     $scriptBlock = "Import-Module SSHFSAutoMount; Mount-SSHFSDrive -Name '$Name'$driveArg -Label '$Label' -Log"
     $argument = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "' + $scriptBlock + '"'
 
-    # 固化为当前运行的确切 pwsh 路径, 避免计划任务环境的 PATH 与交互 shell 不一致(商店版/系统版路径不同)
+    # 固化当前 pwsh 路径: 计划任务环境的 PATH 可能与交互 shell 不同
     $pwshPath = (Get-Process -Id $PID).Path
     if (-not $pwshPath) { $pwshPath = 'pwsh.exe' }
     $action   = New-ScheduledTaskAction -Execute $pwshPath -Argument $argument
     $trigger  = New-ScheduledTaskTrigger -AtLogOn
-    # 默认 DisallowStartIfOnBatteries=true 会导致笔记本电池供电登录时任务不触发, 这里显式放行
+    # 默认禁电池启动, 笔记本用电池登录时任务不触发, 显式放行
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
         -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
     $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
