@@ -164,6 +164,25 @@ function Remove-MountPoints2Label {
     } catch { }
 }
 
+# ---------- 内部函数: 挂载日志 (计划任务隐藏窗口运行时, 事后排查登录挂载失败的唯一线索) ----------
+function Write-MountLog {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Message
+    )
+    try {
+        $logDir = Join-Path $script:StateDir 'logs'
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+        $logFile = Join-Path $logDir "$Name.log"
+        # 单文件超过 512KB 时清空重写, 防止无限增长
+        if ((Test-Path -LiteralPath $logFile) -and ((Get-Item -LiteralPath $logFile).Length -gt 512KB)) {
+            Set-Content -LiteralPath $logFile -Value '' -Encoding utf8
+        }
+        Add-Content -LiteralPath $logFile -Value ("[{0}] {1}" -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $Message) -Encoding utf8
+    } catch { }
+}
+
 # ---------- 内部函数: 从 Z 往前找第一个可用盘符 ----------
 function Get-AvailableDriveLetter {
     # Z=90 递减到 C=67 (跳过 A/B, 避免软驱/系统保留盘符)
@@ -275,6 +294,10 @@ function Mount-SSHFSDrive {
     .PARAMETER RetryInterval
     重试间隔秒数, 默认 5。
 
+    .PARAMETER Log
+    将挂载过程追加写入日志文件 ~/.ssh/sshfsmount/logs/<Name>.log,
+    便于排查计划任务静默运行(-WindowStyle Hidden)时的失败原因。
+
     .EXAMPLE
     Mount-SSHFSDrive home
 
@@ -289,7 +312,8 @@ function Mount-SSHFSDrive {
         [string]$Label,
         [string]$Provider = $script:SSHFSProvider,
         [int]$MaxRetries = 12,
-        [int]$RetryInterval = 5
+        [int]$RetryInterval = 5,
+        [switch]$Log
     )
 
     if (-not $Label) { $Label = $Name }
@@ -303,6 +327,7 @@ function Mount-SSHFSDrive {
         Write-Verbose "未指定盘符, 自动选择: ${DriveLetter}:"
     }
     Write-Verbose "目标: $unc  ->  ${DriveLetter}:"
+    if ($Log) { Write-MountLog -Name $Name -Message "开始挂载: $unc -> ${DriveLetter}: (最多重试 $MaxRetries 次)" }
 
     # SSHFS-Win 同一 user@host 目标只允许一个活动挂载, 重复挂载会报错 64/67。
     # 目标已映射到某盘符时直接复用, 保证命令可重复执行(幂等)。
@@ -316,6 +341,7 @@ function Mount-SSHFSDrive {
             }
             Set-SSHFSDriveLabel -DriveLetter $k -Label $Label -Unc $unc
             Save-MountState -Name $Name -DriveLetter $k -Unc $unc -Label $Label
+            if ($Log) { Write-MountLog -Name $Name -Message "目标已映射到 ${k}:, 直接复用(幂等)" }
             return [pscustomobject]@{
                 Name        = $Name
                 DriveLetter = $k
@@ -331,12 +357,19 @@ function Mount-SSHFSDrive {
         if ($cur) {
             if ($cur -ieq $unc) {
                 Write-Verbose "${DriveLetter}: 已映射到 $unc, 无需重复挂载"
+                if ($Log) { Write-MountLog -Name $Name -Message "${DriveLetter}: 已映射到 $unc, 无需重复挂载(幂等)" }
                 $mounted = $true
                 break
             }
             Write-Warning "${DriveLetter}: 当前映射到 $cur, 先断开旧映射"
             net use "${DriveLetter}:" /delete /y | Out-Null
             Start-Sleep -Seconds 1
+            # 断开失败(常见于映射被进程占用)时立即报错, 避免重试循环空转 MaxRetries 轮
+            if (Get-DriveTarget -DriveLetter $DriveLetter) {
+                $msg = "${DriveLetter}: 旧映射 $cur 断开失败(可能被进程占用), 请手动执行: net use ${DriveLetter}: /delete /y"
+                if ($Log) { Write-MountLog -Name $Name -Message $msg }
+                throw $msg
+            }
             Remove-MountPoints2Label -Unc $cur   # 清掉旧目标的资源管理器显示名残留
         } elseif (Test-Path "${DriveLetter}:\") {
             throw "${DriveLetter}: 被本地设备占用(非网络映射), 请先释放"
@@ -354,18 +387,22 @@ function Mount-SSHFSDrive {
         if (Test-Path -LiteralPath "${DriveLetter}:\" -ErrorAction SilentlyContinue) {
             $mounted = $true
             Write-Warning "net use 返回错误($($err.Trim())), 但 ${DriveLetter}: 已实际挂载, 视为成功"
+            if ($Log) { Write-MountLog -Name $Name -Message "net use 返回错误($($err.Trim())), 但 ${DriveLetter}: 已实际挂载, 视为成功" }
             break
         }
         if ($i -lt $MaxRetries) {
             Write-Verbose "挂载失败, ${RetryInterval} 秒后重试: $($err.Trim())"
+            if ($Log) { Write-MountLog -Name $Name -Message "挂载失败($i/$MaxRetries): $($err.Trim())" }
             Start-Sleep -Seconds $RetryInterval
         } else {
             # 最后一轮兜底: 映射条目可能刚注册而连接尚未完全就绪, Test-Path 可能为 false
             if (Get-DriveTarget -DriveLetter $DriveLetter) {
                 $mounted = $true
                 Write-Warning "net use 返回错误($($err.Trim())), 但 ${DriveLetter}: 已映射, 视为成功"
+                if ($Log) { Write-MountLog -Name $Name -Message "net use 返回错误($($err.Trim())), 但 ${DriveLetter}: 已映射, 视为成功" }
                 break
             }
+            if ($Log) { Write-MountLog -Name $Name -Message "挂载最终失败: $($err.Trim())" }
             throw "挂载失败: $($err.Trim())"
         }
     }
@@ -374,6 +411,7 @@ function Mount-SSHFSDrive {
     # 设置资源管理器盘符显示名
     Set-SSHFSDriveLabel -DriveLetter $DriveLetter -Label $Label -Unc $unc
     Save-MountState -Name $Name -DriveLetter $DriveLetter -Unc $unc -Label $Label
+    if ($Log) { Write-MountLog -Name $Name -Message "挂载成功: $unc -> ${DriveLetter}:" }
 
     return [pscustomobject]@{
         Name        = $Name
@@ -421,20 +459,33 @@ function Register-SSHFSAutoMount {
     )
 
     if (-not $Label) { $Label = $Name }
+
+    # Name/Label 会以单引号字面量嵌入计划任务命令, 含引号会生成损坏的任务命令; Name 还会用作任务名
+    foreach ($v in @($Name, $Label)) {
+        if ($v.Contains("'") -or $v.Contains('"')) {
+            throw "参数值不能包含引号(会导致计划任务命令损坏): $v"
+        }
+    }
+    if ($Name -match '[\\/:*?"<>|]') {
+        throw 'Name 含有计划任务名不允许的字符: \ / : * ? " < > |'
+    }
+
     $taskName = if ($TaskName) { $TaskName } else { "$script:TaskPrefix$Name" }
     $driveDesc = if ($DriveLetter) { " -> ${DriveLetter}:" } else { ' -> 自动盘符' }
     if (-not $Description) {
         $Description = "登录时自动挂载 SSHFS 远程目录 ($Name$driveDesc)"
     }
 
-    # 盘符留空时不传 -DriveLetter, 由计划任务执行时自动从 Z 往前找可用盘符
+    # 盘符留空时不传 -DriveLetter, 由计划任务执行时自动从 Z 往前找可用盘符; -Log 用于登录挂载失败的事后排查
     $driveArg = if ($DriveLetter) { " -DriveLetter '$DriveLetter'" } else { '' }
-    $scriptBlock = "Import-Module SSHFSAutoMount; Mount-SSHFSDrive -Name '$Name'$driveArg -Label '$Label'"
+    $scriptBlock = "Import-Module SSHFSAutoMount; Mount-SSHFSDrive -Name '$Name'$driveArg -Label '$Label' -Log"
     $argument = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "' + $scriptBlock + '"'
 
     $action   = New-ScheduledTaskAction -Execute 'pwsh.exe' -Argument $argument
     $trigger  = New-ScheduledTaskTrigger -AtLogOn
-    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+    # 默认 DisallowStartIfOnBatteries=true 会导致笔记本电池供电登录时任务不触发, 这里显式放行
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
     $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
 
     if ($PSCmdlet.ShouldProcess($taskName, "注册登录自动挂载计划任务 ($scriptBlock)")) {
