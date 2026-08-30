@@ -7,6 +7,7 @@
 #   Register-SSHFSAutoMount  注册登录时自动挂载的计划任务
 #   Get-SSHFSAutoMount    查询本模块注册的所有计划任务
 #   Unregister-SSHFSAutoMount  删除自动挂载计划任务
+#   Update-SSHHostConfig  按主机可达性自动更新 ~/.ssh/config.d/<Name>.conf (别名 uhc)
 #
 # 依赖: PowerShell 7 (pwsh), 计划任务相关函数使用 ScheduledTasks 模块
 # ============================================================
@@ -16,6 +17,10 @@ Set-StrictMode -Version Latest
 $script:SSHFSProvider = 'sshfs.k'   # WinFsp SSHFS 网络提供程序名 (UNC 前缀, 勿改)
 $script:TaskPrefix    = 'SSHFSAutoMount-'
 $script:StateDir      = Join-Path $env:USERPROFILE '.ssh\sshfsmount'   # 挂载状态文件目录
+# SSH Host 可达性探测候选 (数据维护在模块根目录 hostProfiles.json, 新增 Host 直接编辑该 JSON)
+# 约定: JSON 每个候选显式写全 Address/ProxyJump/User 三字段 (ProxyJump 可 null), 保证 StrictMode 下取值安全
+$script:HostProfiles = Get-Content -Raw -Path (Join-Path $PSScriptRoot 'hostProfiles.json') |
+    ConvertFrom-Json -AsHashtable
 
 # ---------- 内部函数: ssh Host 模式匹配 ----------
 # 支持通配符(* ?)与负模式(!pattern, 命中则整块不适用), 语义与 ssh 一致
@@ -483,7 +488,12 @@ function Mount-SSHFSDrive {
 function Register-SSHFSAutoMount {
     <#
     .SYNOPSIS
-    注册"登录时自动挂载"的计划任务, 任务名默认为 SSHFSAutoMount-<Name>。
+    注册"登录时自动更新 SSH 配置并挂载"的计划任务, 任务名默认为 SSHFSAutoMount-<Name>。
+
+    .DESCRIPTION
+    登录时先执行 Update-SSHHostConfig(按可达性自动在直连/跳板间切换 config.d),
+    再执行 Mount-SSHFSDrive 挂载。Name 未定义在 hostProfiles.json 时仅警告,
+    挂载按现有配置继续。
 
     .PARAMETER Name
     ssh config.d 中的 Host 别名(如 home)。
@@ -531,12 +541,13 @@ function Register-SSHFSAutoMount {
     $taskName = if ($TaskName) { $TaskName } else { "$script:TaskPrefix$Name" }
     $driveDesc = if ($DriveLetter) { " -> ${DriveLetter}:" } else { ' -> 自动盘符' }
     if (-not $Description) {
-        $Description = "登录时自动挂载 SSHFS 远程目录 ($Name$driveDesc)"
+        $Description = "登录时自动更新 SSH Host 可达性配置并挂载 SSHFS 远程目录 ($Name$driveDesc)"
     }
 
-    # 盘符留空则由计划任务执行时自动选; -Log 保证登录挂载失败可事后排查
+    # 盘符留空则由计划任务执行时自动选; -Log 保证登录挂载失败可事后排查;
+    # 先按可达性更新 config.d(直连/跳板自动切换), 未知 Host 仅警告不阻断挂载
     $driveArg = if ($DriveLetter) { " -DriveLetter '$DriveLetter'" } else { '' }
-    $scriptBlock = "Import-Module SSHFSAutoMount; Mount-SSHFSDrive -Name '$Name'$driveArg -Label '$Label' -Log"
+    $scriptBlock = "Import-Module SSHFSAutoMount; Update-SSHHostConfig -Name '$Name'; Mount-SSHFSDrive -Name '$Name'$driveArg -Label '$Label' -Log"
     $argument = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "' + $scriptBlock + '"'
 
     # 固化当前 pwsh 路径: 计划任务环境的 PATH 可能与交互 shell 不同
@@ -707,4 +718,122 @@ function Unregister-SSHFSAutoMount {
     }
 }
 
-Export-ModuleMember -Function Mount-SSHFSDrive, Register-SSHFSAutoMount, Get-SSHFSAutoMount, Unregister-SSHFSAutoMount
+# ---------- 5. SSH Host 可达性配置更新 ----------
+# 内部函数: TCP 端口可达性探测
+function Test-TcpPort {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Address,
+        [int]$Port = 22,
+        [int]$TimeoutMs = 2000
+    )
+    try {
+        $client = [System.Net.Sockets.TcpClient]::new()
+        try {
+            $task = $client.ConnectAsync($Address, $Port)
+            if (-not $task.Wait($TimeoutMs)) { return $false }
+            return $client.Connected
+        }
+        finally { $client.Dispose() }
+    }
+    catch { return $false }
+}
+
+function Update-SSHHostConfig {
+    <#
+    .SYNOPSIS
+    按主机可达性自动更新 ~/.ssh/config.d/<Name>.conf：自动选择直连或跳板配置。
+
+    .DESCRIPTION
+    每个 Host 名称对应一份候选探测列表(hostProfiles.json, 按优先级排列),
+    按顺序探测 TCP 端口(默认 SSH 22, 单次超时 2 秒): 首个可连的候选胜出并写入
+    对应配置; 全部不可连时取列表最后一项(通常带 ProxyJump)作为默认值。
+    配置内容未变化时跳过重写, 避免无谓的 mtime 变更。
+
+    .PARAMETER Name
+    Host 名称, 需在 hostProfiles.json 中定义(如 home、bhnas)。
+    未定义时输出警告并返回 $false, 不中断调用方(便于计划任务串联挂载)。
+
+    .PARAMETER ConfigDir
+    SSH 配置目录, 默认 ~/.ssh/config.d。
+
+    .PARAMETER Port
+    探测端口, 默认 22。
+
+    .PARAMETER TimeoutMs
+    单次探测超时毫秒数, 默认 2000。
+
+    .RETURNS
+    $true = 配置已就绪(新写入或内容无变化); $false = 未知 Host 名称。
+
+    .EXAMPLE
+    Update-SSHHostConfig home
+
+    .EXAMPLE
+    uhc bhnas
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Name,
+
+        [string]$ConfigDir = (Join-Path $HOME '.ssh\config.d'),
+
+        [int]$Port = 22,
+
+        [int]$TimeoutMs = 2000
+    )
+
+    if (-not $script:HostProfiles.ContainsKey($Name)) {
+        Write-Warning "未知的 Host 名称：'$Name'。可用：$($script:HostProfiles.Keys -join '、') (hostProfiles.json)"
+        return $false
+    }
+
+    $configPath = Join-Path $ConfigDir "$Name.conf"
+
+    # 按优先级探测, 首个可连者胜出
+    $selected = $null
+    foreach ($c in $script:HostProfiles[$Name]) {
+        if (Test-TcpPort -Address $c.Address -Port $Port -TimeoutMs $TimeoutMs) {
+            Write-Host "✅ $($c.Address)"
+            $selected = $c
+            break
+        }
+        Write-Host "❌ $($c.Address)"
+    }
+
+    # 全部不可连: 取列表最后一项作为默认值
+    if ($null -eq $selected) {
+        $selected = $script:HostProfiles[$Name][-1]
+        if ($selected.ProxyJump) {
+            Write-Host "使用默认值：$($selected.Address) 经 ProxyJump $($selected.ProxyJump)"
+        }
+        else {
+            Write-Host "使用默认值：$($selected.Address)"
+        }
+    }
+
+    $lines = @(
+        "Host $Name"
+        "    HostName $($selected.Address)"
+        "    User $($selected.User)"
+    )
+    if ($selected.ProxyJump) { $lines += "    ProxyJump $($selected.ProxyJump)" }
+    $content = $lines -join "`n"
+
+    # 内容未变化则跳过重写, 避免无谓的 mtime 变更
+    if ((Test-Path $configPath) -and ((Get-Content -Raw $configPath).TrimEnd("`r", "`n") -eq $content)) {
+        Write-Host "无变更：$configPath"
+        return $true
+    }
+
+    New-Item -ItemType Directory -Path $ConfigDir -Force | Out-Null
+    Set-Content -Path $configPath -Value $content -Encoding utf8
+    Write-Host "已写入：$configPath"
+    return $true
+}
+
+Set-Alias -Name uhc -Value Update-SSHHostConfig
+
+Export-ModuleMember -Function Mount-SSHFSDrive, Register-SSHFSAutoMount, Get-SSHFSAutoMount, Unregister-SSHFSAutoMount, Update-SSHHostConfig -Alias uhc
