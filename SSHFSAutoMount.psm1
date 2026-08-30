@@ -17,6 +17,25 @@ $script:SSHFSProvider = 'sshfs.k'   # WinFsp SSHFS 网络提供程序名 (UNC �
 $script:TaskPrefix    = 'SSHFSAutoMount-'
 $script:StateDir      = Join-Path $env:USERPROFILE '.ssh\sshfsmount'   # 挂载状态文件目录
 
+# ---------- 内部函数: ssh Host 模式匹配 ----------
+# 支持通配符(* ?)与负模式(!pattern, 命中则整块不适用), 语义与 ssh 一致
+function Test-SSHFSPatternMatch {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [string[]]$Patterns
+    )
+    $matched = $false
+    foreach ($p in $Patterns) {
+        if ($p.StartsWith('!')) {
+            if ($Name -like $p.Substring(1)) { return $false }
+        } elseif ($Name -like $p) {
+            $matched = $true
+        }
+    }
+    return $matched
+}
+
 # ---------- 内部函数: 解析 ssh config.d 配置 ----------
 function Resolve-SSHFSTarget {
     [CmdletBinding()]
@@ -33,30 +52,35 @@ function Resolve-SSHFSTarget {
 
     $user = $null; $hostName = $null; $port = 22
     $lines = Get-Content -LiteralPath $confFile
-    $blockLines = @(); $inBlock = $false
+    $sawHost = $false; $inBlock = $false
 
+    # ssh 语义: 值取第一个出现的(先命中的块优先), 后续块不覆盖; Host * 等通配块可提供默认值
     foreach ($line in $lines) {
         $t = $line.Trim()
-        if ($t -match '^(Host|Match)\b') {
-            if ($inBlock) { break }                    # 进入下一个块, 结束
+        if ($t -and -not $t.StartsWith('#') -and $t -match '^(Host|Match)\b') {
+            if ($t -match '^Match\b') {
+                # Match 块条件复杂, 视为不适用, 仅作为块边界
+                $inBlock = $false
+                continue
+            }
             if ($t -match '^Host\s+(.+)$') {
-                if (($Matches[1] -split '\s+') -contains $Name) { $inBlock = $true }
+                $sawHost = $true
+                $inBlock = Test-SSHFSPatternMatch -Name $Name -Patterns @($Matches[1] -split '\s+')
             }
         } elseif ($inBlock) {
-            if ($t -and -not $t.StartsWith('#')) { $blockLines += $t }
+            if     (-not $hostName -and $t -match '^HostName\s+(.+)$') { $hostName = $Matches[1].Trim() }
+            elseif (-not $user     -and $t -match '^User\s+(\S+)\s*$') { $user = $Matches[1] }
+            elseif ($port -eq 22 -and $t -match '^Port\s+(\d+)\s*$')   { $port = [int]$Matches[1] }
         }
     }
 
-    # 文件里没有 "Host <Name>" 块时, 把整个文件当做一个配置块
-    if (-not $inBlock) {
-        $blockLines = @($lines | ForEach-Object { $_.Trim() } |
-                        Where-Object { $_ -and -not $_.StartsWith('#') })
-    }
-
-    foreach ($l in $blockLines) {
-        if     ($l -match '^HostName\s+(.+)$') { $hostName = $Matches[1].Trim() }
-        elseif ($l -match '^User\s+(\S+)\s*$') { $user = $Matches[1] }
-        elseif ($l -match '^Port\s+(\d+)\s*$') { $port = [int]$Matches[1] }
+    # 文件里完全没有 Host 行时, 把整个文件当做一个配置块
+    if (-not $sawHost) {
+        foreach ($l in @($lines | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })) {
+            if     (-not $hostName -and $l -match '^HostName\s+(.+)$') { $hostName = $Matches[1].Trim() }
+            elseif (-not $user     -and $l -match '^User\s+(\S+)\s*$') { $user = $Matches[1] }
+            elseif ($port -eq 22 -and $l -match '^Port\s+(\d+)\s*$')   { $port = [int]$Matches[1] }
+        }
     }
     if (-not $hostName) { $hostName = $Name }
     if (-not $user)     { $user = $env:USERNAME }
@@ -186,12 +210,16 @@ function Write-MountLog {
 # ---------- 内部函数: 从 Z 往前找第一个可用盘符 ----------
 function Get-AvailableDriveLetter {
     # Z=90 递减到 C=67 (跳过 A/B, 避免软驱/系统保留盘符)
+    # 本地设备占用(DriveInfo)与已网络映射(Get-DriveTargetMap)都算不可用; 一次性取齐,
+    # 避免旧版逐盘符调用 net use(最多 24 个子进程)
+    $used = @{}
+    foreach ($d in [System.IO.DriveInfo]::GetDrives()) {
+        if ($d.Name -match '^([A-Za-z]):') { $used[$Matches[1].ToUpper()] = $true }
+    }
+    foreach ($letter in (Get-DriveTargetMap).Keys) { $used[$letter] = $true }
     for ($c = 90; $c -ge 67; $c--) {
         $letter = [char]$c
-        # 本地设备占用(Test-Path 为真)或已网络映射(Get-DriveTarget 有值)都算不可用
-        if (-not (Test-Path "${letter}:\") -and -not (Get-DriveTarget -DriveLetter $letter)) {
-            return $letter
-        }
+        if (-not $used.ContainsKey("$letter")) { return $letter }
     }
     throw '未找到可用盘符: Z..C 均被占用'
 }
@@ -481,7 +509,10 @@ function Register-SSHFSAutoMount {
     $scriptBlock = "Import-Module SSHFSAutoMount; Mount-SSHFSDrive -Name '$Name'$driveArg -Label '$Label' -Log"
     $argument = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "' + $scriptBlock + '"'
 
-    $action   = New-ScheduledTaskAction -Execute 'pwsh.exe' -Argument $argument
+    # 固化为当前运行的确切 pwsh 路径, 避免计划任务环境的 PATH 与交互 shell 不一致(商店版/系统版路径不同)
+    $pwshPath = (Get-Process -Id $PID).Path
+    if (-not $pwshPath) { $pwshPath = 'pwsh.exe' }
+    $action   = New-ScheduledTaskAction -Execute $pwshPath -Argument $argument
     $trigger  = New-ScheduledTaskTrigger -AtLogOn
     # 默认 DisallowStartIfOnBatteries=true 会导致笔记本电池供电登录时任务不触发, 这里显式放行
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
@@ -508,10 +539,13 @@ function Register-SSHFSAutoMount {
 function Get-SSHFSAutoMount {
     <#
     .SYNOPSIS
-    查询本模块注册的所有自动挂载计划任务(前缀 SSHFSAutoMount-)。
+    查询本模块注册的所有自动挂载计划任务(前缀 SSHFSAutoMount-), 含上次运行时间与结果。
 
     .PARAMETER Name
     可选, 只查看某个 Host 对应的任务。
+
+    .PARAMETER TaskName
+    可选, 直接按任务名查询(Register 时用 -TaskName 自定义过名称的任务)。
 
     .EXAMPLE
     Get-SSHFSAutoMount
@@ -520,9 +554,12 @@ function Get-SSHFSAutoMount {
     Get-SSHFSAutoMount home
     #>
     [CmdletBinding()]
-    param([Parameter(Position = 0)][string]$Name)
+    param(
+        [Parameter(Position = 0)][string]$Name,
+        [string]$TaskName
+    )
 
-    $pattern = if ($Name) { "$script:TaskPrefix$Name" } else { "$script:TaskPrefix*" }
+    $pattern = if ($TaskName) { $TaskName } elseif ($Name) { "$script:TaskPrefix$Name" } else { "$script:TaskPrefix*" }
     $tasks = @(Get-ScheduledTask -TaskName $pattern -ErrorAction SilentlyContinue)
 
     if ($tasks.Count -eq 0) {
@@ -531,13 +568,20 @@ function Get-SSHFSAutoMount {
     }
 
     foreach ($t in $tasks) {
-        $hostName = $t.TaskName.Substring($script:TaskPrefix.Length)
+        $alias = if ($t.TaskName.StartsWith($script:TaskPrefix)) {
+            $t.TaskName.Substring($script:TaskPrefix.Length)
+        } else {
+            $t.TaskName    # 自定义任务名(不带前缀)时原样展示
+        }
+        $info = Get-ScheduledTaskInfo -TaskName $t.TaskName -ErrorAction SilentlyContinue
         $action   = "$($t.Actions.Execute) $($t.Actions.Arguments)"
         $triggers = ($t.Triggers | ForEach-Object { $_.CimClass.CimClassName }) -join ','
         [pscustomobject]@{
             TaskName    = $t.TaskName
-            Host        = $hostName
+            Host        = $alias
             State       = $t.State
+            LastRunTime = if ($info) { $info.LastRunTime } else { $null }
+            LastResult  = if ($info) { '0x{0:X}' -f $info.LastTaskResult } else { $null }
             Trigger     = $triggers
             Action      = $action
             Description = $t.Description
@@ -549,7 +593,7 @@ function Get-SSHFSAutoMount {
 function Unregister-SSHFSAutoMount {
     <#
     .SYNOPSIS
-    删除自动挂载计划任务。
+    删除自动挂载计划任务, 可选顺带断开映射与清理残留。
 
     .PARAMETER Name
     ssh config.d 中的 Host 别名(如 home)。
@@ -557,14 +601,26 @@ function Unregister-SSHFSAutoMount {
     .PARAMETER TaskName
     计划任务名, 默认 SSHFSAutoMount-<Name>。
 
+    .PARAMETER Dismount
+    顺带断开该别名的网络映射(含配置地址变更前旧 UNC 的映射)。
+
+    .PARAMETER RemoveState
+    顺带清理挂载状态文件(~/.ssh/sshfsmount/<Name>.json)与
+    MountPoints2 中的盘符显示名注册表残留。
+
     .EXAMPLE
     Unregister-SSHFSAutoMount home
+
+    .EXAMPLE
+    Unregister-SSHFSAutoMount home -Dismount -RemoveState   # 彻底移除
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory, Position = 0)]
         [string]$Name,
-        [string]$TaskName
+        [string]$TaskName,
+        [switch]$Dismount,
+        [switch]$RemoveState
     )
 
     $taskName = if ($TaskName) { $TaskName } else { "$script:TaskPrefix$Name" }
@@ -576,6 +632,48 @@ function Unregister-SSHFSAutoMount {
     if ($PSCmdlet.ShouldProcess($taskName, '删除计划任务')) {
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
         Write-Verbose "已删除计划任务: $taskName"
+
+        # 后续清理需要解析 ssh 配置; 配置文件已被删除时降级为仅清理注册表/状态残留
+        $target = $null
+        if ($Dismount -or $RemoveState) {
+            try { $target = Resolve-SSHFSTarget -Name $Name } catch { }
+        }
+
+        if ($Dismount) {
+            $uncs = @()
+            if ($target) { $uncs += $target.UNC }
+            if ($state = Get-MountState -Name $Name) { $uncs += $state.Unc }   # 配置改过地址时, 旧地址的映射也断开
+            $map = Get-DriveTargetMap
+            foreach ($k in @($map.Keys)) {
+                $hit = $uncs | Where-Object { $map[$k] -ieq $_ }
+                if ($hit) {
+                    net use "${k}:" /delete /y | Out-Null
+                    Start-Sleep -Seconds 1
+                    Remove-MountPoints2Label -Unc $map[$k]
+                    Write-Verbose "已断开映射 ${k}: -> $($map[$k])"
+                }
+            }
+        }
+
+        if ($RemoveState) {
+            $f = Join-Path $script:StateDir "$Name.json"
+            if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force }
+            if ($target) {
+                Remove-MountPoints2Label -Unc $target.UNC
+            } else {
+                # 配置已不存在: 按显示名残留(_LabelFromReg = 别名)清理本别名的 MountPoints2 键
+                try {
+                    $base = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2'
+                    foreach ($key in (Get-ChildItem -Path $base -ErrorAction SilentlyContinue)) {
+                        if ($key.PSChildName -notlike "##$script:SSHFSProvider#*") { continue }
+                        $p = Get-ItemProperty -Path $key.PSPath -Name '_LabelFromReg' -ErrorAction SilentlyContinue
+                        if ($p -and $p._LabelFromReg -eq $Name) {
+                            Remove-Item -Path $key.PSPath -Force -ErrorAction SilentlyContinue
+                        }
+                    }
+                } catch { }
+            }
+        }
     }
 }
 
