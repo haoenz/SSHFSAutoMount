@@ -10,7 +10,7 @@ SSHFS-Win 远程目录自动挂载 PowerShell 模块：把 `~/.ssh/config.d/` �
 | `Register-SSHFSAutoMount` | 注册「登录时自动更新配置并挂载」的计划任务（任务名 `SSHFSAutoMount-<Name>`） |
 | `Get-SSHFSAutoMount` | 查询本模块注册的所有计划任务，含上次运行时间与结果 |
 | `Unregister-SSHFSAutoMount` | 删除计划任务，可选顺带断开映射与清理残留 |
-| `Update-SSHHostConfig`（别名 `uhc`） | 按主机可达性自动更新 `~/.ssh/config.d/<Name>.conf`，自动选择直连或跳板配置 |
+| `Update-SSHHostConfig`（别名 `uhc`） | 按主机可达性自动更新 `~/.ssh/config.d/<Name>.conf`，自动选择直连或跳板配置（实现在子模块 `vendor/uhc`） |
 
 ## 环境要求
 
@@ -20,15 +20,25 @@ SSHFS-Win 远程目录自动挂载 PowerShell 模块：把 `~/.ssh/config.d/` �
 
 ## 安装
 
-把模块目录放到 PowerShell 模块路径下，例如：
+模块通过 git submodule 引用 `vendor/uhc`（`Update-SSHHostConfig` 的实现），**必须连同子模块一起克隆**：
 
 ```powershell
-$moduleDir = "$HOME\Documents\PowerShell\Modules\SSHFSAutoMount"
-# 将 SSHFSAutoMount.psd1 与 SSHFSAutoMount.psm1 放入上述目录后：
-Import-Module SSHFSAutoMount
+git clone --recurse-submodules <repo> D:\repo\SSHFSAutoMount
+Import-Module D:\repo\SSHFSAutoMount\SSHFSAutoMount.psd1
 ```
 
-> 注意：模块根目录的 `hostProfiles.json`（可达性探测候选表）属隐私文件，已加入 `.gitignore` 不随仓库分发，新环境需按下文 `Update-SSHHostConfig` 一节的格式手动创建，否则模块导入会因缺少该文件而失败。
+已经克隆但漏了子模块时：
+
+```powershell
+cd D:\repo\SSHFSAutoMount
+git submodule update --init --recursive
+```
+
+> 缺少 `vendor/uhc/UHC.psd1` 时，`Import-Module` 会直接报错并提示上面这条命令。
+
+模块不要求装到 `Documents\PowerShell\Modules`：按路径 `Import-Module <克隆目录>\SSHFSAutoMount.psd1` 即可；想用 `Import-Module SSHFSAutoMount` 简写时，把克隆目录加入 `$env:PSModulePath` 或建一个目录符号链接放进模块路径。
+
+> 注意：可达性探测候选表（隐私文件，不入库）默认位于 `%APPDATA%\uhc\profiles.json`（Linux/macOS 为 `~/.config/uhc/profiles.json`），新环境需按下文 `Update-SSHHostConfig` 一节的格式手动创建；旧位置（模块根目录 `hostProfiles.json`）仍兼容，会提示迁移。缺少该文件不再影响模块导入，仅调用 `uhc` 时告警。
 
 ## 前置准备：ssh config
 
@@ -59,7 +69,7 @@ Mount-SSHFSDrive home
 # 2. 指定盘符与显示名
 Mount-SSHFSDrive home -DriveLetter Y -Label home
 
-# 3. 手动按可达性更新配置（直连/跳板自动切换，探测结果逐行显示 ✅/❌）
+# 3. 手动按可达性更新配置（直连/跳板自动切换，逐行显示 OK/FAIL）
 Update-SSHHostConfig home
 uhc bhnas           # 别名等价
 
@@ -113,10 +123,11 @@ Register-SSHFSAutoMount <Name> [-DriveLetter <char>] [-Label <string>]
 ### Update-SSHHostConfig（别名 uhc）
 
 ```
-Update-SSHHostConfig <Name> [-ConfigDir <string>] [-Port <int>] [-TimeoutMs <int>]
+Update-SSHHostConfig <Name> [-ProfilesPath <string>] [-ConfigDir <string>] [-Port <int>] [-TimeoutMs <int>]
 ```
 
-- 探测候选表维护在模块根目录 `hostProfiles.json`。**该文件含内网/跳板机地址，属隐私文件，已加入 `.gitignore` 不入库**；新增 Host 直接编辑该 JSON，每个候选显式写全 `Address` / `ProxyJump` / `User` 三字段（`ProxyJump` 可为 `null`，保证 StrictMode 下取值安全）。结构示例：
+- 实现在子模块 `vendor/uhc`（`UHC.psm1`）；同目录的 `uhc.sh` 是等价的 bash 实现，两者共用 profiles 格式与输出契约
+- 探测候选表默认位于 `%APPDATA%\uhc\profiles.json`（Linux/macOS 为 `$XDG_CONFIG_HOME/uhc/profiles.json`，缺省 `~/.config/uhc/profiles.json`），可用 `-ProfilesPath` 指定；旧位置（模块根目录 `hostProfiles.json`）仍会识别并提示迁移。**该文件含内网/跳板机地址，属隐私文件，不入库**；新增 Host 直接编辑该 JSON，每个候选显式写全 `Address` / `ProxyJump` / `User` 三字段（`ProxyJump` 可为 `null`，保证 StrictMode 下取值安全）。结构示例：
 
   ```json
   {
@@ -129,6 +140,7 @@ Update-SSHHostConfig <Name> [-ConfigDir <string>] [-Port <int>] [-TimeoutMs <int
   ```
 
 - 按优先级顺序探测 TCP 端口（默认 22，单次超时 2 秒），首个可连者胜出写入配置；全部不可连时取列表最后一项（通常带 ProxyJump）作为默认值
+- 逐行输出 `OK <地址>` / `FAIL <地址>` / `SELECT <地址> [<跳板>]` / `WRITE <文件>` / `UNCHANGED <文件>`；未知 Host 打印 `UNKNOWN <名称>` 到 stderr
 - 配置内容未变化时跳过重写（不改 mtime）
 - 返回 `$true` = 配置已就绪（新写入或无变化）；未知 Host 名称输出警告并返回 `$false`，不中断调用方（便于在计划任务中与挂载串联）
 - 登录计划任务（`Register-SSHFSAutoMount`）会自动先执行本函数再挂载，网络环境变化时无需手动改配置
@@ -184,7 +196,7 @@ SSHFS-Win 的挂载是异步的：冷启动时 `net use` 可能返回错误 67�
 | 路径 | 说明 |
 |---|---|
 | `~/.ssh/config.d/<Name>.conf` | ssh 配置源（`Update-SSHHostConfig` 的写入目标） |
-| 模块根目录 `hostProfiles.json` | 可达性探测候选表（别名 → 候选列表）；**隐私文件，已 gitignore 不入库** |
+| `%APPDATA%\uhc\profiles.json` | 可达性探测候选表（别名 → 候选列表）；**隐私文件，不入库**；旧位置模块根目录 `hostProfiles.json` 仍兼容 |
 | `~/.ssh/sshfsmount/<Name>.json` | 挂载状态（别名 → 盘符/UNC/显示名/更新时间） |
 | `~/.ssh/sshfsmount/logs/<Name>.log` | 挂载日志（`-Log` 时写入，超 512KB 自动清空重写） |
 | `HKCU:\...\Explorer\MountPoints2\##sshfs.k#*` | 盘符显示名注册（模块写入与清理） |
@@ -200,4 +212,5 @@ SSHFS-Win 的挂载是异步的：冷启动时 `net use` 可能返回错误 67�
 
 ## 版本
 
+- **1.2.0**：`Update-SSHHostConfig` 拆到子模块 `vendor/uhc`，并附带等价的 bash 实现 `uhc.sh`；profiles 默认迁到用户配置目录（`%APPDATA%\uhc\profiles.json`），旧位置仍兼容；探测输出改为纯文本 `OK`/`FAIL`/`SELECT`/`WRITE`/`UNCHANGED`；模块导入不再因缺少 profiles 失败
 - **1.1.0**：可靠性修复（幂等复用、假失败兜底、失效映射原地替换）、`-Force` 保护、挂载日志、通配/负模式 Host、`LastRunTime`/`LastResult` 查询、`-Dismount`/`-RemoveState` 清理；新增 `Update-SSHHostConfig`（`uhc`）按主机可达性自动切换直连/跳板，登录计划任务改为先更新配置再挂载

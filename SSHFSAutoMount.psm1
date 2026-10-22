@@ -17,10 +17,13 @@ Set-StrictMode -Version Latest
 $script:SSHFSProvider = 'sshfs.k'   # WinFsp SSHFS 网络提供程序名 (UNC 前缀, 勿改)
 $script:TaskPrefix    = 'SSHFSAutoMount-'
 $script:StateDir      = Join-Path $env:USERPROFILE '.ssh\sshfsmount'   # 挂载状态文件目录
-# SSH Host 可达性探测候选 (数据维护在模块根目录 hostProfiles.json, 新增 Host 直接编辑该 JSON)
-# 约定: JSON 每个候选显式写全 Address/ProxyJump/User 三字段 (ProxyJump 可 null), 保证 StrictMode 下取值安全
-$script:HostProfiles = Get-Content -Raw -Path (Join-Path $PSScriptRoot 'hostProfiles.json') |
-    ConvertFrom-Json -AsHashtable
+# 可达性更新逻辑位于子模块 vendor/uhc (Update-SSHHostConfig 为其薄包装)
+# 显式加载并给出可操作的报错, 避免忘记 git submodule update --init 时只看到 "找不到 UHC.psd1"
+$script:UHCManifest = Join-Path $PSScriptRoot 'vendor/uhc/UHC.psd1'
+if (-not (Test-Path -LiteralPath $script:UHCManifest)) {
+    throw "缺少子模块 vendor/uhc，请先执行: git submodule update --init --recursive (期望文件: $script:UHCManifest)"
+}
+Import-Module $script:UHCManifest -ErrorAction Stop
 
 # ---------- 内部函数: ssh Host 模式匹配 ----------
 # 支持通配符(* ?)与负模式(!pattern, 命中则整块不适用), 语义与 ssh 一致
@@ -718,41 +721,27 @@ function Unregister-SSHFSAutoMount {
     }
 }
 
-# ---------- 5. SSH Host 可达性配置更新 ----------
-# 内部函数: TCP 端口可达性探测
-function Test-TcpPort {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$Address,
-        [int]$Port = 22,
-        [int]$TimeoutMs = 2000
-    )
-    try {
-        $client = [System.Net.Sockets.TcpClient]::new()
-        try {
-            $task = $client.ConnectAsync($Address, $Port)
-            if (-not $task.Wait($TimeoutMs)) { return $false }
-            return $client.Connected
-        }
-        finally { $client.Dispose() }
-    }
-    catch { return $false }
-}
-
+# ---------- 5. SSH Host 可达性配置更新 (实现位于子模块 vendor/uhc) ----------
 function Update-SSHHostConfig {
     <#
     .SYNOPSIS
-    按主机可达性自动更新 ~/.ssh/config.d/<Name>.conf：自动选择直连或跳板配置。
+    按主机可达性自动更新 ~/.ssh/config.d/<Name>.conf: 自动选择直连或跳板配置。
 
     .DESCRIPTION
-    每个 Host 名称对应一份候选探测列表(hostProfiles.json, 按优先级排列),
-    按顺序探测 TCP 端口(默认 SSH 22, 单次超时 2 秒): 首个可连的候选胜出并写入
-    对应配置; 全部不可连时取列表最后一项(通常带 ProxyJump)作为默认值。
-    配置内容未变化时跳过重写, 避免无谓的 mtime 变更。
+    实现在子模块 vendor/uhc (UHC.psm1), 与 Linux 侧 uhc.sh 行为等价:
+    按 profiles 候选列表依次探测 TCP 端口, 首个可连者胜出并写入配置,
+    全部不可连时取列表末项(通常带 ProxyJump); 内容未变化时跳过重写。
+
+    profiles 数据默认位于 %APPDATA%\uhc\profiles.json
+    (Linux/macOS: $XDG_CONFIG_HOME/uhc/profiles.json, 缺省 ~/.config/uhc/profiles.json);
+    旧部署放在模块根目录的 hostProfiles.json 仍会自动识别(带 warning)。
 
     .PARAMETER Name
-    Host 名称, 需在 hostProfiles.json 中定义(如 home、bhnas)。
-    未定义时输出警告并返回 $false, 不中断调用方(便于计划任务串联挂载)。
+    Host 名称, 需在 profiles.json 中定义。未定义时输出警告并返回 $false,
+    不中断调用方(便于在计划任务中与挂载串联)。
+
+    .PARAMETER ProfilesPath
+    profiles 文件路径; 留空按用户配置目录解析。
 
     .PARAMETER ConfigDir
     SSH 配置目录, 默认 ~/.ssh/config.d。
@@ -764,7 +753,7 @@ function Update-SSHHostConfig {
     单次探测超时毫秒数, 默认 2000。
 
     .RETURNS
-    $true = 配置已就绪(新写入或内容无变化); $false = 未知 Host 名称。
+    $true = 配置已就绪(新写入或内容无变化); $false = 未知 Host / profiles 缺失。
 
     .EXAMPLE
     Update-SSHHostConfig home
@@ -778,60 +767,13 @@ function Update-SSHHostConfig {
         [ValidateNotNullOrEmpty()]
         [string]$Name,
 
-        [string]$ConfigDir = (Join-Path $HOME '.ssh\config.d'),
-
+        [string]$ProfilesPath,
+        [string]$ConfigDir,
         [int]$Port = 22,
-
         [int]$TimeoutMs = 2000
     )
 
-    if (-not $script:HostProfiles.ContainsKey($Name)) {
-        Write-Warning "未知的 Host 名称：'$Name'。可用：$($script:HostProfiles.Keys -join '、') (hostProfiles.json)"
-        return $false
-    }
-
-    $configPath = Join-Path $ConfigDir "$Name.conf"
-
-    # 按优先级探测, 首个可连者胜出
-    $selected = $null
-    foreach ($c in $script:HostProfiles[$Name]) {
-        if (Test-TcpPort -Address $c.Address -Port $Port -TimeoutMs $TimeoutMs) {
-            Write-Host "✅ $($c.Address)"
-            $selected = $c
-            break
-        }
-        Write-Host "❌ $($c.Address)"
-    }
-
-    # 全部不可连: 取列表最后一项作为默认值
-    if ($null -eq $selected) {
-        $selected = $script:HostProfiles[$Name][-1]
-        if ($selected.ProxyJump) {
-            Write-Host "使用默认值：$($selected.Address) 经 ProxyJump $($selected.ProxyJump)"
-        }
-        else {
-            Write-Host "使用默认值：$($selected.Address)"
-        }
-    }
-
-    $lines = @(
-        "Host $Name"
-        "    HostName $($selected.Address)"
-        "    User $($selected.User)"
-    )
-    if ($selected.ProxyJump) { $lines += "    ProxyJump $($selected.ProxyJump)" }
-    $content = $lines -join "`n"
-
-    # 内容未变化则跳过重写, 避免无谓的 mtime 变更
-    if ((Test-Path $configPath) -and ((Get-Content -Raw $configPath).TrimEnd("`r", "`n") -eq $content)) {
-        Write-Host "无变更：$configPath"
-        return $true
-    }
-
-    New-Item -ItemType Directory -Path $ConfigDir -Force | Out-Null
-    Set-Content -Path $configPath -Value $content -Encoding utf8
-    Write-Host "已写入：$configPath"
-    return $true
+    Invoke-UHCUpdate -Name $Name -ProfilesPath $ProfilesPath -ConfigDir $ConfigDir -Port $Port -TimeoutMs $TimeoutMs
 }
 
 Set-Alias -Name uhc -Value Update-SSHHostConfig

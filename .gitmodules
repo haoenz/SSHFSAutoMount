@@ -1,0 +1,3 @@
+[submodule "vendor/uhc"]
+	path = vendor/uhc
+	url = git@github.com:haoenz/uhc.git
